@@ -1,0 +1,15 @@
+[project]
+name = "bridge-isl"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "huggingface-hub>=0.24,<1.0",
+    "numpy>=2.5.4",
+    "pandas>=3.1.1",
+    "pose-format>=0.15.0",
+    "pyyaml>=6.0.3",
+    "requests>=2.34.2",
+    "torch>=2.15.0",
+    "tqdm>=4.70.1",
+]
