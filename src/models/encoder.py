@@ -70,6 +70,10 @@ class ConvSubsampler(nn.Module):
         for stage in self.stages:
             h = stage(h)
             lengths = (lengths + 1) // 2
+            # Re-zero padding: conv bias + GELU make padded steps non-zero, and the next stage's
+            # last real step would read them -> a clip's output would depend on its batch-mates.
+            valid = torch.arange(h.shape[-1], device=h.device)[None, :] < lengths[:, None]
+            h = h * valid[:, None, :].to(h.dtype)
         return h.transpose(1, 2), lengths
 
 

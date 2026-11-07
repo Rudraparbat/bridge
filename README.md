@@ -14,15 +14,15 @@ This is a class project and research paper. It uses the **iSign** dataset, which
 
 ## The big picture
 
-There are 5 steps. Steps 1–3 are done.
-
-| # | Step | What it does (simply) | Status |
-|---|------|------------------------|--------|
-| 1 | **Download** | Get the stick-figure files for ~30,000 sign clips | ✅ done |
-| 2 | **Clean up** | Make every clip the same format so the model can read it | ✅ done |
-| 3 | **Train the encoder** (Stage 0) | Teach the model to *understand movement* | ✅ done |
-| 4 | **Connect to a language model** (Stage 1) | Teach it to turn movement into *words* | ⬜ next |
-| 5 | **Fine-tune** (Stage 2) | Make the sentences better | ⬜ later |
+| # | Step | What it does (simply) | Who | Status |
+|---|------|------------------------|-----|--------|
+| 1 | **Download** | Get the stick-figure files for ~30,000 sign clips | owner | ✅ done |
+| 2 | **Clean up** | Make every clip the same format so the model can read it | owner | ✅ done |
+| 3 | **Train the encoder** (Stage 0) | Teach the model to *understand movement* | owner | ✅ done |
+| 4 | **Hand-off** | Package the encoder's results (~0.75 GB) for a teammate | owner | ✅ done |
+| 5 | **Connect to a language model** (Stage 1) | Teach it to turn movement into *words* | teammate | ⬜ next |
+| 6 | **Fine-tune** (Stage 2) | Make the sentences better | teammate | ⬜ |
+| 7 | **Final polish + test score** | Train everything together, measure once on test | owner | ⬜ |
 
 ---
 
@@ -194,14 +194,145 @@ encoder = PoseEncoder.from_checkpoint("checkpoints/stage0/best.pt")
 
 ---
 
-## 4. Next: connect to a language model (Stage 1). Coming soon
+## 4. Hand-off to a teammate (owner)
+
+**Why not just send the `.pt` file?** The `.pt` file is the trained *model*. To train the next part (the MLP), your teammate also needs *examples*: "this signing → this sentence". Those examples come from the 66 GB of data, which is too big to send.
+
+**The trick:** we run the encoder over every clip **once** and save what it outputs. That is small (~0.75 GB), and it is exactly what the MLP needs as input. Your teammate does not need the raw data at all.
+
+```bash
+uv run python -m src.export --zip        # takes ~2 min → creates handoff/ and handoff.zip
+```
+
+**What's inside `handoff/`:**
+
+| File | What it is |
+|------|------------|
+| `embeddings_train.npy` (+ `_val`, `_test`) | the encoder's output for every clip (256 numbers per step) |
+| `index_train.csv` (+ `_val`, `_test`) | which rows belong to which clip, plus the **English sentence** |
+| `encoder_stage0.pt` | the trained encoder itself (needed later for the final step and demos) |
+| `stats.npz`, `feature_layout.json` | needed to prepare **new** videos the same way |
+| `info.json` | sizes, settings, scores |
+
+**How to send it:**
+
+1. Push the code: `git add -A && git commit -m "..." && git push`
+2. Share `handoff.zip` **privately** (private Google Drive link or a private Hugging Face repo). Never public.
+3. Your teammate should also accept the [iSign terms](https://huggingface.co/datasets/Exploration-Lab/iSign) on Hugging Face (1 minute, no download).
+
+---
+
+## 5. Teammate: build the MLP and train (Stage 1 + Stage 2)
 
 ```
-movement ──► ENCODER ──► PROJECTOR (small MLP) ──► Flan-T5 (language model) ──► sentence
-             (done)       (to build)                 (frozen, already knows English)
+encoder output ──► PROJECTOR (the MLP) ──► Flan-T5 (language model) ──► English sentence
+ (in handoff/)       you build this         already knows English
 ```
 
-The projector translates the encoder's numbers into the language model's "language". Only the encoder and projector learn; Flan-T5 stays as it is.
+**Think of it like this:** the encoder speaks "sign language numbers", Flan-T5 speaks English. The projector is the **translator in the middle**.
+
+### Step 1: Setup (10 min)
+
+```bash
+git clone <repo-url> && cd bridge
+uv sync
+uv add transformers peft sentencepiece sacrebleu
+# unzip handoff.zip so the files are in bridge/handoff/
+```
+
+### Step 2: Check the data loads (1 min)
+
+```bash
+uv run python -c "from src.data import EmbeddingDataset; ds=EmbeddingDataset('handoff','train'); print(len(ds), ds[0]['h'].shape, ds[0]['text'])"
+```
+
+You should see `25030`, a shape like `[40, 256]`, and an English sentence.
+
+### Step 3: Build the projector (`src/models/projector.py`)
+
+A small MLP: 256 numbers in, 768 numbers out (the size Flan-T5-base expects).
+
+```python
+import torch.nn as nn
+
+class Projector(nn.Module):
+    def __init__(self, in_dim=256, out_dim=768, hidden=768, dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(in_dim, hidden), nn.GELU(), nn.Dropout(dropout),
+                                 nn.Linear(hidden, out_dim), nn.LayerNorm(out_dim))
+
+    def forward(self, h):          # (batch, steps, 256) -> (batch, steps, 768)
+        return self.net(h)
+```
+
+### Step 4: Stage 1: train only the projector (`src/training/stage1.py`)
+
+Flan-T5 is **frozen** (it doesn't change). Only the projector learns to "talk" to it.
+
+The core of the training loop:
+
+```python
+from src.data import EmbeddingDataset, collate_embeddings
+# load Flan-T5:  t5 = T5ForConditionalGeneration.from_pretrained("google/flan-t5-base"); t5.requires_grad_(False)
+
+for batch in loader:                                   # batch.h, batch.mask, batch.texts
+    labels = tokenizer(batch.texts, padding=True, return_tensors="pt").input_ids
+    labels[labels == tokenizer.pad_token_id] = -100    # ignore padding
+    loss = t5(inputs_embeds=projector(batch.h),
+              attention_mask=batch.mask.long(), labels=labels).loss
+    loss.backward(); optimizer.step(); optimizer.zero_grad()
+```
+
+- Settings: learning rate `3e-4`, batch size `32`, ~10 epochs.
+- After each epoch, generate sentences on **val** and score them:
+
+```python
+ids = t5.generate(inputs_embeds=projector(batch.h), attention_mask=batch.mask.long(),
+                  num_beams=5, max_new_tokens=64)
+sentences = tokenizer.batch_decode(ids, skip_special_tokens=True)
+# score with sacrebleu.corpus_bleu(sentences, [references])
+```
+
+- **Expect:** at first, generic sentences. Then more correct topics and words. BLEU-4 around **1–4** is normal here.
+
+### Step 5: Stage 2: add LoRA (`src/training/stage2.py`)
+
+Now Flan-T5 is allowed to adapt **a little**, through small add-on weights called LoRA (~1–2% of its size). Its main weights stay frozen.
+
+```python
+from peft import LoraConfig, get_peft_model
+projector.load_state_dict(torch.load("checkpoints/stage1/projector.pt"))   # start from Stage 1
+t5 = get_peft_model(t5, LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05,
+                                   target_modules=["q", "k", "v", "o"]))
+# same loop as Stage 1, ~10 epochs. Learning rates: projector 1e-4, LoRA 2e-4
+t5.save_pretrained("checkpoints/stage2/lora")
+torch.save(projector.state_dict(), "checkpoints/stage2/projector.pt")
+```
+
+- **Expect:** better word choice. BLEU-4 around **3–7** is a good result for this data.
+
+### Step 6: Send back to the owner
+
+| What | How |
+|------|-----|
+| code (`projector.py`, `stage1.py`, `stage2.py`) | git push |
+| `checkpoints/stage2/projector.pt` + `checkpoints/stage2/lora/` | private Drive (not git) |
+| val scores per epoch + ~20 examples (real vs generated sentence) | for the paper |
+
+### Rules
+
+1. **Never tune on `test`.** Use `val`. The test score is measured **once**, at the very end.
+2. Use `google/flan-t5-base` (or `flan-t5-small` for quick tries).
+3. Write down the settings of every run (for the paper's comparison table).
+4. Don't share the hand-off files outside the team.
+
+**Time:** Stage 1 ~2–3 h, Stage 2 ~3–5 h on a laptop with a GPU. On a laptop **without** a GPU it is much slower, so use a free GPU on Google Colab or Kaggle (upload `handoff.zip` there), or use `flan-t5-small` / `EmbeddingDataset(..., max_clips=2000)` for quick tests.
+
+---
+
+## 6. Final step (owner)
+
+When the teammate sends back the projector + LoRA: load encoder + projector + LoRA, let the **encoder** learn a little too (low learning rate, 1–2 epochs on the real data), then measure **once** on the test split. That number goes in the paper.
 
 ---
 
@@ -214,11 +345,13 @@ bridge/
 │   ├── env.py             reads HF_TOKEN from .env
 │   ├── extraction/        step 1: download
 │   ├── preprocessing/     step 2: clean up, split, stats
-│   ├── data/              loads clean clips for training
+│   ├── data/              loads clean clips (and hand-off embeddings) for training
 │   ├── models/            the encoder (+ helper heads)
-│   └── training/          step 3: Stage 0 training
+│   ├── training/          step 3: Stage 0 training
+│   └── export/            step 4: build the hand-off package
 ├── data/                  (not in git) all data
 ├── checkpoints/           (not in git) trained models
+├── handoff/               (not in git) the package for the teammate
 ├── pyproject.toml, uv.lock
 └── .env.example           copy to .env and add your token
 ```
@@ -231,6 +364,7 @@ uv run python -m src.extraction --limit 30000                  # 1. download
 uv run python -m src.preprocessing                             # 2. clean up
 uv run python -m src.training.stage0                           # 3. train encoder
 uv run python -m src.training.stage0 --resume checkpoints/stage0/last.pt   # 3. continue
+uv run python -m src.export --zip                              # 4. hand-off package
 ```
 
 These work the same on macOS, Windows, and Linux. For long runs, keep the computer awake (see step 3).

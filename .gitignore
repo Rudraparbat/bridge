@@ -19,7 +19,8 @@ __pycache__/
 # ---- Training outputs (share checkpoints privately, not via git) -----------
 checkpoints/
 test_outputs/
-handoff/
+/handoff/
+/handoff.zip
 logs/
 runs/
 *.pt
